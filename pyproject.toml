@@ -1,0 +1,18 @@
+[project]
+name = "pyscripts"
+version = "0.1.0"
+description = "My Python scripts"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+select = ["ALL"]
+ignore = ["ANN", "EXE", "D", "PTH", "FBT"]
