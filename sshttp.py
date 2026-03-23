@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import contextlib
 import datetime
@@ -9,9 +10,9 @@ import http.client
 import http.server
 import json
 import os
+import queue
 import random
 import selectors
-import socket
 import struct
 import sys
 import threading
@@ -37,7 +38,7 @@ class MyLog:
 
     @staticmethod
     def debug(msg: str) -> None:
-        MyLog.log(MyLog.DEBUG, msg)
+        pass
 
     @staticmethod
     def info(msg: str) -> None:
@@ -81,70 +82,102 @@ class MyCryptoStream:
         dd = bytes(data[i] ^ self._key[(rr + i) % self.KEY_SIZE] for i in range(xl))
         return self.MAGIC + struct.pack("<HH", xl, rr) + dd
 
-    def decrypt(self, data: bytes) -> bytes:
-        _, xl, rr = struct.unpack("<IHH", data[: self.HDR_SIZE])
-        return bytes(data[self.HDR_SIZE + i] ^ self._key[(rr + i) % self.KEY_SIZE] for i in range(xl))
-
-    def feed(self, data: bytes) -> None:
+    def decrypt(self, data: bytes) -> typing.Iterable[bytes]:
         self._stream.extend(data)
-
-    def parse(self) -> typing.Iterable[bytes]:
-        while len(self._stream) > 0:
+        while len(self._stream) >= self.HDR_SIZE:
             if not self._stream.startswith(self.MAGIC):
                 self._stream.pop(0)
                 continue
-            if len(self._stream) < self.HDR_SIZE:
-                break
-            xl = struct.unpack("<H", self._stream[4:6])[0]
+            xl, rr = struct.unpack("<HH", self._stream[4:8])
             if len(self._stream) < xl + self.HDR_SIZE:
                 break
-            dd = bytes(self._stream[: xl + self.HDR_SIZE])
-            self._stream = self._stream[xl + self.HDR_SIZE :]
-            yield self.decrypt(dd)
-
-
-def mkxid() -> str:
-    rid = random.randint(0x1000, 0xFFFF)  # noqa: S311
-    ts = int(time.monotonic() * 1000) + 0x10000000000
-    return f"x{ts:x}x{rid:x}"
+            dd = bytes(self._stream[self.HDR_SIZE : xl + self.HDR_SIZE])
+            self._stream = self._stream[self.HDR_SIZE + xl :]
+            dx = bytes(dd[i] ^ self._key[(rr + i) % self.KEY_SIZE] for i in range(xl))
+            yield dx
 
 
 class MySession:
-    def __init__(self, ssh_host: str, ssh_port: int) -> None:
-        self.xid = mkxid()
+    def __init__(self, loop: asyncio.AbstractEventLoop, ssh_host: str, ssh_port: int) -> None:
+        self.loop = loop
+        self.tx_q: asyncio.Queue[bytes] = asyncio.Queue()
+        self.rx_q: queue.Queue[bytes | None] = queue.Queue()
+
+        self.ssh_host = ssh_host
+        self.ssh_port = ssh_port
+        self.running = False
+
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+        self.tasks: list[asyncio.Task] = []
+
+        rid = random.randint(0x1000, 0xFFFF)  # noqa: S311
+        ts = int(time.monotonic() * 1000) + 0x10000000000
+        self.xid = f"x{ts:x}x{rid:x}"
         self.stream = MyCryptoStream(self.xid)
-        self.sshsk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sshsk.connect((ssh_host, ssh_port))
-        self.sshsk.setblocking(False)
+
+    def start(self) -> bool:
+        fu = asyncio.run_coroutine_threadsafe(self.connect(), self.loop)
+        rx = fu.result()
+        if not rx:
+            return False
+
         self.running = True
+        assert self.reader is not None
+        assert self.writer is not None
+        self.tasks.append(self.loop.create_task(self._send_loop(self.writer)))
+        self.tasks.append(self.loop.create_task(self._receive_loop(self.reader)))
+
+        return True
 
     def close(self) -> None:
         self.running = False
-        self.sshsk.close()
+        self.rx_q.put(None)
 
-    def send(self, data: bytes) -> None:
-        self.sshsk.sendall(data)
-
-    def receive(self) -> typing.Iterable[bytes]:
-        sel = selectors.DefaultSelector()
-        sel.register(self.sshsk, selectors.EVENT_READ)
+    async def connect(self) -> bool:
         try:
-            while self.running:
-                events = sel.select(0.1)
-                if not events:
-                    yield b""
-                for key, _ in events:
-                    if key.fileobj != self.sshsk:
-                        continue
-
-                    data = self.sshsk.recv(4096)
-                    if not data:
-                        break
-                    yield data
+            reader, writer = await self.loop.create_task(asyncio.open_connection(self.ssh_host, self.ssh_port))
+            self.reader = reader
+            self.writer = writer
+            return True  # noqa: TRY300
         except Exception:  # noqa: BLE001
             tb = traceback.format_exc()
             MyLog.error(f"{tb}")
-        self.close()
+            return False
+
+    async def _send_loop(self, writer: asyncio.StreamWriter) -> None:
+        try:
+            while self.running:
+                data = await self.tx_q.get()
+                MyLog.debug(f">> [{len(data):4d}] {data}")
+                writer.write(data)
+                await writer.drain()
+        except Exception:  # noqa: BLE001
+            tb = traceback.format_exc()
+            MyLog.error(f"{tb}")
+            self.running = False
+        finally:
+            writer.close()
+
+    async def _receive_loop(self, reader: asyncio.StreamReader) -> None:
+        try:
+            while self.running:
+                data = await reader.read(1024)
+                MyLog.debug(f"<< [{len(data):4d}] {data}")
+                if not data:
+                    break
+                self.rx_q.put(data)
+        except Exception:  # noqa: BLE001
+            tb = traceback.format_exc()
+            MyLog.error(f"{tb}")
+            self.running = False
+
+    def feed(self, data: bytes) -> None:
+        asyncio.run_coroutine_threadsafe(self.tx_q.put(data), self.loop)
+
+    def fetch(self) -> bytes | None:
+        dd = self.rx_q.get()
+        return dd  # noqa: RET504
 
 
 class SessionManager:
@@ -152,8 +185,12 @@ class SessionManager:
         self.sessions: dict[str, MySession] = {}
         self.lock = threading.Lock()
 
+        self.loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self._loop_thread.start()
+
     def create(self, ssh_host: str, ssh_port: int) -> MySession:
-        sess = MySession(ssh_host, ssh_port)
+        sess = MySession(self.loop, ssh_host, ssh_port)
         with self.lock:
             self.sessions[sess.xid] = sess
         return sess
@@ -173,7 +210,7 @@ class MyHTTPHandler(http.server.BaseHTTPRequestHandler):
     SESS_MGR: typing.ClassVar[SessionManager] = SessionManager()
     URL_PATH: typing.ClassVar[str] = "/api/v1/stream"
 
-    def log_message(self, fmtstr: str, *args: typing.Any) -> None:
+    def log_message(self, format: str, *args: typing.Any) -> None:  # noqa: A002
         pass
 
     def do_POST(self) -> None:
@@ -198,7 +235,7 @@ class MyHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_init(authdata)
             return
 
-        xid = authdata.get("xid")
+        xid = authdata.get("xid", "")
         sess = self.SESS_MGR.get(xid)
         if not sess:
             self.send_error(401)
@@ -234,6 +271,9 @@ class MyHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             sess = self.SESS_MGR.create(host, port)
+            if not sess.start():
+                self.send_error(500)
+                return
             resp = base64.b64encode(json.dumps({"xid": sess.xid}).encode("utf-8"))
             self.send_response(200)
             self.send_header("X-Accel-Buffering", "no")
@@ -260,10 +300,8 @@ class MyHTTPHandler(http.server.BaseHTTPRequestHandler):
                     break
                 dd = self.rfile.read(xl)
                 self.rfile.read(2)  # skip \r\n
-                sess.stream.feed(dd)
-                for bx in sess.stream.parse():
-                    # MyLog.debug(f"<< [{len(bx):4d}] {bx}")
-                    sess.send(bx)
+                for dx in sess.stream.decrypt(dd):
+                    sess.feed(dx)
             self.send_response(200)
             self.end_headers()
         except Exception:  # noqa: BLE001
@@ -280,15 +318,13 @@ class MyHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         while True:
-            for dd in sess.receive():
-                if not dd:
-                    continue
-                # MyLog.debug(f">> [{len(dd):4d}] {dd}")
-                dx = sess.stream.encrypt(dd)
-                chunk = f"{len(dx):x}\r\n".encode()
-                self.wfile.write(chunk + dx + b"\r\n")
-            MyLog.error(f"{sess.xid} EOF")
-            break
+            dd = sess.fetch()
+            if dd is None:
+                break
+            dx = sess.stream.encrypt(dd)
+            chunk = f"{len(dx):x}\r\n".encode()
+            self.wfile.write(chunk + dx + b"\r\n")
+        MyLog.error(f"{sess.xid} EOF")
 
 
 def run_server(listen: str, port: int, path: str) -> None:
@@ -378,23 +414,22 @@ class SSHProxyClient:
                 MyLog.error(f"<{self.path}>: {res.reason}")
                 self.close()
                 return
+
+            while self.running:
+                try:
+                    dd = res.read1(4096)
+                except Exception:  # noqa: BLE001
+                    break
+                for bx in self.stream.decrypt(dd):
+                    MyLog.debug(f">> [{len(bx):4d}] {bx}")
+                    sys.stdout.buffer.write(bx)
+                    sys.stdout.buffer.flush()
         except Exception:  # noqa: BLE001
             tb = traceback.format_exc()
             MyLog.error(f"downstream failed: {tb}")
-            self.close()
             return
-
-        while self.running:
-            try:
-                dd = res.read1(4096)
-            except Exception:  # noqa: BLE001
-                break
-            self.stream.feed(dd)
-            for bx in self.stream.parse():
-                # MyLog.debug(f">> [{len(bx):4d}] {bx}")
-                sys.stdout.buffer.write(bx)
-                sys.stdout.buffer.flush()
-        self.close()
+        finally:
+            self.close()
 
     def _upstreaming(self) -> None:
         auth = {
@@ -405,7 +440,7 @@ class SSHProxyClient:
         for dd in self._stdin_reading():
             if not dd:
                 continue
-            # MyLog.debug(f"<< [{len(dd):4d}] {dd}")
+            MyLog.debug(f"<< [{len(dd):4d}] {dd}")
             dx = self.stream.encrypt(dd)
             chunk = f"{len(dx):x}\r\n".encode("ascii")
             conn.send(chunk + dx + b"\r\n")
@@ -437,7 +472,7 @@ class SSHProxyClient:
         receiver.join()
 
 
-def run_client(proxy: str | None, path: str, ssh_host: str, ssh_port: int) -> None:
+def run_client(proxy: str, path: str, ssh_host: str, ssh_port: int) -> None:
     try:
         parts = proxy.split(":")
         proxy_host = parts[0]
@@ -453,6 +488,7 @@ def run_client(proxy: str | None, path: str, ssh_host: str, ssh_port: int) -> No
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging")
     ap.add_argument("--path", type=str, default="/api/v1/stream", help="URL path to use")
 
     subparsers = ap.add_subparsers(dest="mode", required=True)
@@ -467,6 +503,9 @@ def main() -> None:
     client_parser.add_argument("port", type=int, nargs="?", default=22)
 
     args = ap.parse_args()
+    if args.debug:
+        MyLog.debug = lambda msg: MyLog.log(MyLog.DEBUG, msg)  # type: ignore  # noqa: PGH003
+
     if args.mode == "server":
         run_server(args.listen, args.port, args.path)
     else:
